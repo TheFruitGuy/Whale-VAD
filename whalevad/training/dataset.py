@@ -13,8 +13,10 @@ from __future__ import annotations
 import csv
 import math
 import random
+import re
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -118,9 +120,18 @@ class Segment:
 # ------------------------------------------------------------- CSV annotations
 
 
-_DEFAULT_LABEL_KEYS = ("label", "tag", "class", "event_label", "Label", "Tag")
-_DEFAULT_ONSET_KEYS = ("onset", "start", "start_time", "begin_time", "Begin Time (s)")
-_DEFAULT_OFFSET_KEYS = ("offset", "end", "end_time", "stop", "stop_time", "End Time (s)")
+_DEFAULT_LABEL_KEYS = (
+    "label", "tag", "class", "event_label", "annotation",
+    "Label", "Tag", "Annotation",
+)
+_DEFAULT_ONSET_KEYS = (
+    "onset", "start", "start_time", "begin_time",
+    "start_datetime", "Begin Time (s)",
+)
+_DEFAULT_OFFSET_KEYS = (
+    "offset", "end", "end_time", "stop", "stop_time",
+    "end_datetime", "End Time (s)",
+)
 _DEFAULT_LOW_FREQ_KEYS = ("low_frequency", "low_freq", "freq_low", "Low Freq (Hz)")
 _DEFAULT_HIGH_FREQ_KEYS = ("high_frequency", "high_freq", "freq_high", "High Freq (Hz)")
 
@@ -132,53 +143,73 @@ def _pick(row: Mapping[str, str], keys: Sequence[str]) -> Optional[str]:
     return None
 
 
-def load_annotations_csv(csv_path: Path) -> List[Annotation]:
+# Filenames like ``2015-02-04T03-00-00_000.wav`` encode the recording's start
+# datetime.  We accept the ISO date, dash-separated time, and optional
+# fractional seconds (treated as milliseconds when 3 digits).
+_FILENAME_DATETIME_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:[_.](\d+))?"
+)
+
+
+def parse_audio_file_start_datetime(filename: str) -> Optional[datetime]:
+    """Extract the recording start datetime from a BioDCASE-style filename.
+
+    Returns ``None`` when the filename doesn't match the expected pattern.
+    """
+    m = _FILENAME_DATETIME_RE.search(Path(filename).stem)
+    if not m:
+        return None
+    date, hh, mm, ss, fraction = m.groups()
+    fraction_str = fraction or "0"
+    # Treat fractional seconds as milliseconds (typical BioDCASE convention).
+    micros = (fraction_str + "000000")[:6]
+    try:
+        return datetime.fromisoformat(f"{date}T{hh}:{mm}:{ss}.{micros}")
+    except ValueError:
+        return None
+
+
+def _annotation_time_to_seconds(
+    value: Optional[str], file_start: Optional[datetime]
+) -> Optional[float]:
+    """Convert an annotation time field to seconds-from-file-start.
+
+    Accepts both numeric strings (already in seconds) and ISO datetime
+    strings.  For the datetime variant, ``file_start`` is required.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if file_start is None:
+        return None
+    return (dt - file_start).total_seconds()
+
+
+def load_annotations_csv(
+    csv_path: Path,
+    *,
+    file_start: Optional[datetime] = None,
+) -> List[Annotation]:
     """Parse a CSV annotation file.
 
-    Supports several common header conventions used by the BioDCASE / ATBFL
-    distribution (``onset/offset/label`` or the Raven-style
-    ``Begin Time (s)`` / ``End Time (s)``).
+    Supports several common header conventions:
+
+    * ``onset/offset/label`` (numeric seconds, used by ATBFL 2025)
+    * ``Begin Time (s)/End Time (s)/Tag`` (Raven Pro)
+    * ``start_datetime/end_datetime/annotation`` (BioDCASE 2026, where
+      times are ISO datetimes that must be converted to seconds using
+      ``file_start`` — the recording's start datetime).
     """
-    annotations: List[Annotation] = []
-    with open(csv_path, "r", newline="") as fh:
-        try:
-            sniff = csv.Sniffer().sniff(fh.read(4096))
-            fh.seek(0)
-            reader = csv.DictReader(fh, dialect=sniff)
-        except csv.Error:
-            fh.seek(0)
-            reader = csv.DictReader(fh)
-        for row in reader:
-            label = _pick(row, _DEFAULT_LABEL_KEYS)
-            onset_raw = _pick(row, _DEFAULT_ONSET_KEYS)
-            offset_raw = _pick(row, _DEFAULT_OFFSET_KEYS)
-            if label is None or onset_raw is None or offset_raw is None:
-                continue
-            try:
-                onset = float(onset_raw)
-                offset = float(offset_raw)
-            except ValueError:
-                continue
-            if offset <= onset:
-                continue
-            low_raw = _pick(row, _DEFAULT_LOW_FREQ_KEYS)
-            high_raw = _pick(row, _DEFAULT_HIGH_FREQ_KEYS)
-            try:
-                low_freq = float(low_raw) if low_raw is not None else None
-                high_freq = float(high_raw) if high_raw is not None else None
-            except ValueError:
-                low_freq = None
-                high_freq = None
-            annotations.append(
-                Annotation(
-                    onset_s=onset,
-                    offset_s=offset,
-                    label=label.strip(),
-                    low_freq_hz=low_freq,
-                    high_freq_hz=high_freq,
-                )
-            )
-    return annotations
+    rows = _read_rows(csv_path)
+    resolver = (lambda _fname: file_start) if file_start is not None else None
+    return _rows_to_annotations(rows, file_start_resolver=resolver)
 
 
 # ------------------------------------------------------- Dataset construction
@@ -299,10 +330,15 @@ def load_audio_files(
             is_per_site_index = csv_path.stem != audio_path.stem
             if is_per_site_index:
                 rows = site_csv_cache.setdefault(csv_path, _read_rows(csv_path))
-                all_anns = _rows_to_annotations(rows)
+                all_anns = _rows_to_annotations(
+                    rows, file_start_resolver=parse_audio_file_start_datetime
+                )
                 anns = _filter_annotations_for_file(all_anns, audio_path.name, rows)
             else:
-                anns = load_annotations_csv(csv_path)
+                anns = load_annotations_csv(
+                    csv_path,
+                    file_start=parse_audio_file_start_datetime(audio_path.name),
+                )
         audio_files.append(
             AudioFile(
                 path=audio_path,
@@ -314,7 +350,17 @@ def load_audio_files(
     return audio_files
 
 
-def _rows_to_annotations(rows: Sequence[Mapping[str, str]]) -> List[Annotation]:
+def _rows_to_annotations(
+    rows: Sequence[Mapping[str, str]],
+    *,
+    file_start_resolver: Optional[Callable[[str], Optional[datetime]]] = None,
+) -> List[Annotation]:
+    """Convert CSV rows into ``Annotation`` objects.
+
+    When ``file_start_resolver`` is supplied, datetime-valued onsets/offsets
+    are converted to seconds-from-file-start using the per-row filename
+    (taken from the ``filename``/``file``/``audio_file`` column).
+    """
     out: List[Annotation] = []
     for row in rows:
         label = _pick(row, _DEFAULT_LABEL_KEYS)
@@ -322,13 +368,24 @@ def _rows_to_annotations(rows: Sequence[Mapping[str, str]]) -> List[Annotation]:
         offset_raw = _pick(row, _DEFAULT_OFFSET_KEYS)
         if label is None or onset_raw is None or offset_raw is None:
             continue
-        try:
-            onset = float(onset_raw)
-            offset = float(offset_raw)
-        except ValueError:
+
+        file_start: Optional[datetime] = None
+        if file_start_resolver is not None:
+            fname = (
+                row.get("filename")
+                or row.get("file")
+                or row.get("audio_file")
+                or ""
+            )
+            fname = Path(fname).name
+            if fname:
+                file_start = file_start_resolver(fname)
+
+        onset = _annotation_time_to_seconds(onset_raw, file_start)
+        offset = _annotation_time_to_seconds(offset_raw, file_start)
+        if onset is None or offset is None or offset <= onset:
             continue
-        if offset <= onset:
-            continue
+
         low_raw = _pick(row, _DEFAULT_LOW_FREQ_KEYS)
         high_raw = _pick(row, _DEFAULT_HIGH_FREQ_KEYS)
         try:
@@ -352,13 +409,27 @@ def _rows_to_annotations(rows: Sequence[Mapping[str, str]]) -> List[Annotation]:
 # ----------------------------------------------------------- Segment helpers
 
 
+# Case-insensitive lookup tables so that BioDCASE-2026 lowercase labels
+# (``bma``, ``bmb``, ...) map to the canonical mixed-case names used here.
+_CLASS_MAP_7_LOWER = {name.lower(): name for name in CLASS_MAP_7}
+_CLASS_MAP_3_LOWER = {name.lower(): name for name in CLASS_MAP_3}
+_SEVEN_TO_THREE_LOWER = {k.lower(): v for k, v in SEVEN_TO_THREE.items()}
+
+
 def map_label_to_class(label: str, num_classes: int) -> Optional[str]:
+    """Map a raw annotation label onto the configured class space.
+
+    Case-insensitive; returns ``None`` for unknown labels.
+    """
+    if not label:
+        return None
+    key = label.strip().lower()
     if num_classes == 7:
-        return label if label in CLASS_MAP_7 else None
+        return _CLASS_MAP_7_LOWER.get(key)
     if num_classes == 3:
-        if label in CLASS_MAP_3:
-            return label
-        return SEVEN_TO_THREE.get(label)
+        if key in _CLASS_MAP_3_LOWER:
+            return _CLASS_MAP_3_LOWER[key]
+        return _SEVEN_TO_THREE_LOWER.get(key)
     raise ValueError(f"Unsupported num_classes={num_classes}")
 
 

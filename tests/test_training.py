@@ -148,6 +148,50 @@ def test_load_audio_files_per_site_index_csv(tmp_path: Path) -> None:
     assert len(by_name["rec2.wav"].annotations) == 2
 
 
+def test_load_audio_files_biodcase_2026_schema(tmp_path: Path) -> None:
+    """BioDCASE 2026: ISO datetime onsets + lowercase labels + 'annotation' column."""
+    root = tmp_path / "ds"
+    # Filename encodes the recording start time per BioDCASE convention.
+    audio_name = "2015-02-04T03-00-00_000.wav"
+    _write_audio(root / "audio" / "siteY" / audio_name, duration_s=4000.0)
+    (root / "annotations").mkdir(parents=True, exist_ok=True)
+    with open(root / "annotations" / "siteY.csv", "w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "dataset", "filename", "annotation", "annotator",
+                "low_frequency", "high_frequency",
+                "start_datetime", "end_datetime",
+            ],
+        )
+        writer.writeheader()
+        # 27 min 32.053 s into the recording
+        writer.writerow({
+            "dataset": "siteY", "filename": audio_name, "annotation": "bma",
+            "annotator": "test", "low_frequency": "21.9", "high_frequency": "28.4",
+            "start_datetime": "2015-02-04T03:27:32.053000",
+            "end_datetime":   "2015-02-04T03:27:43.709000",
+        })
+        # 5 s call near the start, label is lowercase 7-class
+        writer.writerow({
+            "dataset": "siteY", "filename": audio_name, "annotation": "bp20",
+            "annotator": "test", "low_frequency": "18.0", "high_frequency": "22.0",
+            "start_datetime": "2015-02-04T03:00:10.000000",
+            "end_datetime":   "2015-02-04T03:00:15.000000",
+        })
+    files = load_audio_files(root)
+    assert len(files) == 1
+    anns = files[0].annotations
+    assert len(anns) == 2
+    # First annotation should be at 27*60 + 32.053 seconds into the file.
+    first = next(a for a in anns if a.label == "bma")
+    assert pytest.approx(first.onset_s, abs=1e-3) == 27 * 60 + 32.053
+    assert pytest.approx(first.offset_s - first.onset_s, abs=1e-3) == 11.656
+    second = next(a for a in anns if a.label == "bp20")
+    assert pytest.approx(second.onset_s, abs=1e-3) == 10.0
+    assert pytest.approx(second.offset_s, abs=1e-3) == 15.0
+
+
 def test_num_spec_frames_matches_torchaudio() -> None:
     audio = torch.randn(1, 1, 1250)  # 5 seconds @ 250 Hz
     spec = torchaudio.transforms.Spectrogram(
