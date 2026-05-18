@@ -106,6 +106,10 @@ class TrainingConfig:
 
     # ----------------------------------------------------- Misc
     seed: int = 42
+    # When True, force PyTorch's cuDNN backend into deterministic mode
+    # (also disables benchmarking).  Costs some throughput but makes
+    # CNN ops bit-identical across runs.
+    deterministic: bool = False
     device: str = "cuda"
     log_interval: int = 50  # iterations
     threshold_search_grid: int = 101  # thresholds tried for per-class θ_c

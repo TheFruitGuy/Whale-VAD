@@ -254,10 +254,51 @@ class Trainer:
         return p / f"{Path(dataset_root).name}.json" if p.is_dir() else p
 
     def _setup_seed(self, seed: int) -> None:
+        """Seed every randomness source we know about for reproducibility.
+
+        Covers Python ``random``, NumPy, PyTorch (CPU + CUDA), the
+        ``PYTHONHASHSEED`` env var (affects dict/set ordering in some
+        edge cases), and PyTorch's cuDNN backend.  ``deterministic_cudnn``
+        is opt-in via ``cfg.deterministic`` because it can slow some
+        convolutions noticeably.
+        """
+        import os as _os
+
+        _os.environ["PYTHONHASHSEED"] = str(seed)
         random.seed(seed)
+        try:
+            import numpy as _np
+
+            _np.random.seed(seed % (2**32))
+        except ImportError:
+            pass
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        if getattr(self.cfg, "deterministic", False):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            # Non-deterministic but faster — typical training default.
+            torch.backends.cudnn.benchmark = True
+
+    @staticmethod
+    def _seed_worker(worker_id: int) -> None:
+        """DataLoader ``worker_init_fn`` that seeds each worker reproducibly.
+
+        Uses ``torch.initial_seed()`` (which the main process seeds with
+        ``base_seed + worker_id`` automatically), then propagates it into
+        Python's ``random`` and NumPy so per-worker augmentation is
+        deterministic across runs.
+        """
+        worker_seed = torch.initial_seed() % (2**32)
+        random.seed(worker_seed)
+        try:
+            import numpy as _np
+
+            _np.random.seed(worker_seed)
+        except ImportError:
+            pass
 
     def _compute_pos_weight(self) -> Tensor:
         """Per-class :math:`w_c = N / P_c` weighting (Section 5.6).
@@ -303,6 +344,11 @@ class Trainer:
 
     def _make_dataloader(self, dataset: ATBFLDataset, *, shuffle: bool) -> DataLoader:
         cfg = self.cfg
+        # Per-epoch deterministic shuffle: seed the generator from the
+        # global seed plus the epoch so each epoch has a different but
+        # reproducible order.
+        generator = torch.Generator()
+        generator.manual_seed(cfg.seed + max(0, self.epoch))
         return DataLoader(
             dataset,
             batch_size=cfg.batch_size,
@@ -312,6 +358,8 @@ class Trainer:
             collate_fn=collate_segments,
             persistent_workers=cfg.num_workers > 0,
             drop_last=shuffle,
+            worker_init_fn=self._seed_worker,
+            generator=generator,
         )
 
     # ---------------------------------------------------------------- run

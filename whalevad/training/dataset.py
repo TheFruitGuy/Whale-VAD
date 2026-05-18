@@ -404,8 +404,16 @@ def load_audio_files(
         _index_cache_save(index_cache_path, cache)
 
     audio_files: List[AudioFile] = []
-    # Cache per-site CSV rows so we only parse each file once.
-    site_csv_cache: Dict[Path, List[Dict[str, str]]] = {}
+    # Pre-process per-site CSVs exactly once into a {filename: [Annotation]}
+    # lookup table so the per-audio pairing step is O(1).
+    per_site_anns: Dict[Path, Dict[str, List[Annotation]]] = {}
+    for _ap, _csv in pairs:
+        if _csv is None or _csv in per_site_anns or _csv.stem == _ap.stem:
+            continue
+        rows = _read_rows(_csv)
+        per_site_anns[_csv] = _rows_to_annotations_by_file(
+            rows, file_start_resolver=parse_audio_file_start_datetime
+        )
 
     iterator = progress(
         pairs,
@@ -420,16 +428,12 @@ def load_audio_files(
         duration_s = num_frames / float(sample_rate)
 
         anns: List[Annotation] = []
-        if csv_path is not None and csv_path.exists():
-            # Treat the CSV as a per-site index whenever its stem does not
-            # match the audio file name (i.e. it cannot be a per-file CSV).
+        if csv_path is not None:
+            # ``_find_paired_files`` only returns CSV paths it has already
+            # stat'd, so we can trust them without another .exists() call.
             is_per_site_index = csv_path.stem != audio_path.stem
             if is_per_site_index:
-                rows = site_csv_cache.setdefault(csv_path, _read_rows(csv_path))
-                all_anns = _rows_to_annotations(
-                    rows, file_start_resolver=parse_audio_file_start_datetime
-                )
-                anns = _filter_annotations_for_file(all_anns, audio_path.name, rows)
+                anns = per_site_anns.get(csv_path, {}).get(audio_path.name, [])
             else:
                 anns = load_annotations_csv(
                     csv_path,
@@ -446,59 +450,96 @@ def load_audio_files(
     return audio_files
 
 
+def _row_filename(row: Mapping[str, str]) -> str:
+    return Path(
+        row.get("filename") or row.get("file") or row.get("audio_file") or ""
+    ).name
+
+
+def _row_to_annotation(
+    row: Mapping[str, str], file_start: Optional[datetime]
+) -> Optional[Annotation]:
+    """Parse a single CSV row into an ``Annotation``; return ``None`` on failure."""
+    label = _pick(row, _DEFAULT_LABEL_KEYS)
+    onset_raw = _pick(row, _DEFAULT_ONSET_KEYS)
+    offset_raw = _pick(row, _DEFAULT_OFFSET_KEYS)
+    if label is None or onset_raw is None or offset_raw is None:
+        return None
+    onset = _annotation_time_to_seconds(onset_raw, file_start)
+    offset = _annotation_time_to_seconds(offset_raw, file_start)
+    if onset is None or offset is None or offset <= onset:
+        return None
+    low_raw = _pick(row, _DEFAULT_LOW_FREQ_KEYS)
+    high_raw = _pick(row, _DEFAULT_HIGH_FREQ_KEYS)
+    try:
+        low_freq = float(low_raw) if low_raw is not None else None
+        high_freq = float(high_raw) if high_raw is not None else None
+    except ValueError:
+        low_freq = None
+        high_freq = None
+    return Annotation(
+        onset_s=onset,
+        offset_s=offset,
+        label=label.strip(),
+        low_freq_hz=low_freq,
+        high_freq_hz=high_freq,
+    )
+
+
 def _rows_to_annotations(
     rows: Sequence[Mapping[str, str]],
     *,
     file_start_resolver: Optional[Callable[[str], Optional[datetime]]] = None,
 ) -> List[Annotation]:
-    """Convert CSV rows into ``Annotation`` objects.
+    """Convert CSV rows into a flat ``List[Annotation]``.
 
-    When ``file_start_resolver`` is supplied, datetime-valued onsets/offsets
-    are converted to seconds-from-file-start using the per-row filename
-    (taken from the ``filename``/``file``/``audio_file`` column).
+    ``file_start_resolver`` is called with the row's filename (or an
+    empty string when the CSV has no filename column) — so for per-file
+    CSVs the resolver can ignore its argument and return a constant.
+    Results are cached per unique filename.
     """
+    file_start_cache: Dict[str, Optional[datetime]] = {}
     out: List[Annotation] = []
     for row in rows:
-        label = _pick(row, _DEFAULT_LABEL_KEYS)
-        onset_raw = _pick(row, _DEFAULT_ONSET_KEYS)
-        offset_raw = _pick(row, _DEFAULT_OFFSET_KEYS)
-        if label is None or onset_raw is None or offset_raw is None:
-            continue
-
-        file_start: Optional[datetime] = None
+        fname = _row_filename(row)
         if file_start_resolver is not None:
-            fname = (
-                row.get("filename")
-                or row.get("file")
-                or row.get("audio_file")
-                or ""
-            )
-            fname = Path(fname).name
-            if fname:
-                file_start = file_start_resolver(fname)
+            if fname not in file_start_cache:
+                file_start_cache[fname] = file_start_resolver(fname)
+            file_start = file_start_cache[fname]
+        else:
+            file_start = None
+        ann = _row_to_annotation(row, file_start)
+        if ann is not None:
+            out.append(ann)
+    return out
 
-        onset = _annotation_time_to_seconds(onset_raw, file_start)
-        offset = _annotation_time_to_seconds(offset_raw, file_start)
-        if onset is None or offset is None or offset <= onset:
+
+def _rows_to_annotations_by_file(
+    rows: Sequence[Mapping[str, str]],
+    *,
+    file_start_resolver: Optional[Callable[[str], Optional[datetime]]] = None,
+) -> Dict[str, List[Annotation]]:
+    """Group CSV rows into a ``{audio_filename: List[Annotation]}`` mapping.
+
+    Used for per-site CSVs to avoid re-parsing the entire CSV once per
+    audio file in the site.  Rows without a filename column are dropped
+    (they can't be attributed to any specific audio file).
+    """
+    file_start_cache: Dict[str, Optional[datetime]] = {}
+    out: Dict[str, List[Annotation]] = {}
+    for row in rows:
+        fname = _row_filename(row)
+        if not fname:
             continue
-
-        low_raw = _pick(row, _DEFAULT_LOW_FREQ_KEYS)
-        high_raw = _pick(row, _DEFAULT_HIGH_FREQ_KEYS)
-        try:
-            low_freq = float(low_raw) if low_raw is not None else None
-            high_freq = float(high_raw) if high_raw is not None else None
-        except ValueError:
-            low_freq = None
-            high_freq = None
-        out.append(
-            Annotation(
-                onset_s=onset,
-                offset_s=offset,
-                label=label.strip(),
-                low_freq_hz=low_freq,
-                high_freq_hz=high_freq,
-            )
-        )
+        if file_start_resolver is not None:
+            if fname not in file_start_cache:
+                file_start_cache[fname] = file_start_resolver(fname)
+            file_start = file_start_cache[fname]
+        else:
+            file_start = None
+        ann = _row_to_annotation(row, file_start)
+        if ann is not None:
+            out.setdefault(fname, []).append(ann)
     return out
 
 
