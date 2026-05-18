@@ -49,6 +49,7 @@ from .metrics import (
     find_optimal_thresholds,
     macro_f1,
 )
+from ._progress import progress
 from .postprocessing import collapse_seven_to_three
 from .sampling import StochasticNegativeSampler
 
@@ -328,7 +329,14 @@ class Trainer:
         self.model.train()
         running: Dict[str, float] = {}
         n_batches = 0
-        for it, batch in enumerate(loader):
+        bar = progress(
+            loader,
+            desc=f"train ep{self.epoch}",
+            total=len(loader),
+            unit="batch",
+            leave=False,
+        )
+        for it, batch in enumerate(bar):
             self.optimizer.zero_grad(set_to_none=True)
             losses = self._forward_loss(batch, train=True)
             losses["loss"].backward()
@@ -338,16 +346,14 @@ class Trainer:
                 )
             self.optimizer.step()
             self.global_step += 1
+            loss_val = float(losses["loss"].detach().item())
             for k, v in losses.items():
                 running[k] = running.get(k, 0.0) + float(v.detach().item())
             n_batches += 1
+            if hasattr(bar, "set_postfix"):
+                bar.set_postfix(loss=f"{loss_val:.4f}")
             if it % self.cfg.log_interval == 0:
-                log.info(
-                    "  ep%d it%d loss=%.4f",
-                    self.epoch,
-                    it,
-                    float(losses["loss"].detach().item()),
-                )
+                log.info("  ep%d it%d loss=%.4f", self.epoch, it, loss_val)
         return {k: v / max(1, n_batches) for k, v in running.items()}
 
     # ------------------------------------------------------- validation
@@ -359,7 +365,14 @@ class Trainer:
         all_targets: List[Tensor] = []
         bce_sum = 0.0
         n_batches = 0
-        for batch in loader:
+        bar = progress(
+            loader,
+            desc=f"val ep{self.epoch}",
+            total=len(loader),
+            unit="batch",
+            leave=False,
+        )
+        for batch in bar:
             forward = self._forward_logits(batch)
             logits = forward["logits"]
             targets = forward["targets"]

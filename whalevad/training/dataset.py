@@ -24,6 +24,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from ._progress import progress
+
 
 # ---------------------------------------------------------------------- Classes
 
@@ -303,6 +305,7 @@ def load_audio_files(
     annotation_subdir: str = "annotations",
     audio_ext: str = ".wav",
     annotation_ext: str = ".csv",
+    show_progress: bool = True,
 ) -> List[AudioFile]:
     """Discover and index all audio files plus their annotations under ``root``."""
     root = Path(root)
@@ -319,7 +322,14 @@ def load_audio_files(
     # Cache per-site CSV rows so we only parse each file once.
     site_csv_cache: Dict[Path, List[Dict[str, str]]] = {}
 
-    for audio_path, csv_path in pairs:
+    iterator = progress(
+        pairs,
+        desc=f"Indexing {root.name}",
+        total=len(pairs),
+        disable=not show_progress,
+        unit="file",
+    )
+    for audio_path, csv_path in iterator:
         sample_rate, num_frames = _audio_info(audio_path)
         duration_s = num_frames / float(sample_rate)
 
@@ -448,10 +458,18 @@ def build_positive_segments(
     collar_min_s: float,
     collar_max_s: float,
     rng: random.Random,
+    show_progress: bool = True,
 ) -> List[Segment]:
     """Build one segment per annotation with a random collar (Section 5.1)."""
     segments: List[Segment] = []
-    for af in audio_files:
+    iterator = progress(
+        audio_files,
+        desc="Building positive segments",
+        total=len(audio_files),
+        disable=not show_progress,
+        unit="file",
+    )
+    for af in iterator:
         for ann in af.annotations:
             if map_label_to_class(ann.label, num_classes) is None:
                 continue
@@ -478,13 +496,21 @@ def build_eval_segments(
     *,
     segment_s: float,
     overlap_s: float,
+    show_progress: bool = True,
 ) -> List[Segment]:
     """Tile audio files into overlapping fixed-length segments (Section 5.1)."""
     if overlap_s >= segment_s:
         raise ValueError("overlap must be smaller than segment length")
     stride = segment_s - overlap_s
     out: List[Segment] = []
-    for af in audio_files:
+    iterator = progress(
+        audio_files,
+        desc="Building eval tiles",
+        total=len(audio_files),
+        disable=not show_progress,
+        unit="file",
+    )
+    for af in iterator:
         t = 0.0
         while t < af.duration_s:
             end = min(af.duration_s, t + segment_s)
