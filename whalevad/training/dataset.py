@@ -193,16 +193,17 @@ def _find_paired_files(
 ) -> List[Tuple[Path, Optional[Path]]]:
     """Discover audio files and pair them with annotation CSVs.
 
-    Two layouts are supported:
+    Layouts supported (probed in order):
 
-    1. ``root/{audio_subdir}/<site>/<file>.wav`` and
+    1. ``root/{audio_subdir}/<site>/<file>.wav`` paired with
        ``root/{annotation_subdir}/<site>/<file>.csv`` (per-file CSVs).
-    2. ``root/{site}/<file>.wav`` with ``root/{site}/annotations.csv``
+    2. ``root/{audio_subdir}/<site>/<file>.wav`` paired with
+       ``root/{annotation_subdir}/<site>.csv`` (one CSV per site).
+    3. ``root/{site}/<file>.wav`` with ``root/{site}/annotations.csv``
        carrying all calls for that site (with a ``filename`` column).
 
-    For layout (2) we still return per-audio pairs by splitting the CSV
-    later, so we just return ``(audio_path, csv_path)`` for the per-site
-    annotations file if no per-file CSV exists.
+    For layouts (2) and (3) the loader filters per-audio annotations
+    later using the ``filename`` column in the CSV.
     """
     pairs: List[Tuple[Path, Optional[Path]]] = []
     audio_dir = root / audio_subdir if (root / audio_subdir).exists() else root
@@ -214,11 +215,19 @@ def _find_paired_files(
 
     for audio_path in sorted(audio_dir.rglob(f"*{audio_ext}")):
         rel = audio_path.relative_to(audio_dir)
+        # Layout 1: per-file CSV mirroring the audio tree.
         candidate = ann_dir / rel.with_suffix(annotation_ext)
         if candidate.exists():
             pairs.append((audio_path, candidate))
             continue
-        # Per-site CSV fallback.
+        # Layout 2: one CSV per site in the annotations folder.
+        if len(rel.parts) >= 2:
+            site = rel.parts[0]
+            site_index = ann_dir / f"{site}{annotation_ext}"
+            if site_index.exists():
+                pairs.append((audio_path, site_index))
+                continue
+        # Layout 3: per-site annotations.csv co-located with the audio.
         site_csv = audio_path.parent / f"annotations{annotation_ext}"
         if site_csv.exists():
             pairs.append((audio_path, site_csv))
@@ -285,7 +294,10 @@ def load_audio_files(
 
         anns: List[Annotation] = []
         if csv_path is not None and csv_path.exists():
-            if csv_path.name.lower() == f"annotations{annotation_ext.lower()}":
+            # Treat the CSV as a per-site index whenever its stem does not
+            # match the audio file name (i.e. it cannot be a per-file CSV).
+            is_per_site_index = csv_path.stem != audio_path.stem
+            if is_per_site_index:
                 rows = site_csv_cache.setdefault(csv_path, _read_rows(csv_path))
                 all_anns = _rows_to_annotations(rows)
                 anns = _filter_annotations_for_file(all_anns, audio_path.name, rows)

@@ -123,6 +123,31 @@ def test_load_audio_files(tiny_dataset: Tuple[Path, Path]) -> None:
     assert total_anns == 3
 
 
+def test_load_audio_files_per_site_index_csv(tmp_path: Path) -> None:
+    """BioDCASE 2026 layout: one CSV per site under annotations/."""
+    root = tmp_path / "ds"
+    _write_audio(root / "audio" / "siteX" / "rec1.wav", duration_s=10.0)
+    _write_audio(root / "audio" / "siteX" / "rec2.wav", duration_s=10.0)
+    # Per-site CSV with a filename column.
+    (root / "annotations").mkdir(parents=True, exist_ok=True)
+    with open(root / "annotations" / "siteX.csv", "w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["filename", "onset", "offset", "label"]
+        )
+        writer.writeheader()
+        writer.writerow({"filename": "rec1.wav", "onset": "1.0", "offset": "2.0",
+                         "label": "BmA"})
+        writer.writerow({"filename": "rec2.wav", "onset": "3.0", "offset": "4.0",
+                         "label": "BmD"})
+        writer.writerow({"filename": "rec2.wav", "onset": "5.5", "offset": "6.5",
+                         "label": "Bp20"})
+    files = load_audio_files(root)
+    assert len(files) == 2
+    by_name = {af.path.name: af for af in files}
+    assert len(by_name["rec1.wav"].annotations) == 1
+    assert len(by_name["rec2.wav"].annotations) == 2
+
+
 def test_num_spec_frames_matches_torchaudio() -> None:
     audio = torch.randn(1, 1, 1250)  # 5 seconds @ 250 Hz
     spec = torchaudio.transforms.Spectrogram(
