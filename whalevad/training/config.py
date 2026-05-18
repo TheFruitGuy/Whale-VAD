@@ -111,6 +111,13 @@ class TrainingConfig:
     threshold_search_grid: int = 101  # thresholds tried for per-class θ_c
     pin_memory: bool = True
 
+    # Audio-header indexing parallelism + on-disk cache (massively speeds
+    # up the dataset scan on networked filesystems).  Set
+    # ``audio_index_cache_path`` to "none" to disable the cache entirely;
+    # leave empty to use ``<root>/.whalevad_audio_index.json``.
+    audio_index_workers: int = 16
+    audio_index_cache_path: str = ""
+
     # Optional explicit class list ordering (otherwise inferred from
     # config.num_classes).  Useful when ground-truth CSVs use a non-default
     # naming convention.

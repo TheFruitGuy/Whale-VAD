@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import random
 import re
 import wave
@@ -298,6 +299,39 @@ def _read_rows(csv_path: Path) -> List[Dict[str, str]]:
         return [dict(r) for r in reader]
 
 
+def _safe_mtime(path: Path) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _index_cache_load(cache_path: Optional[Path]) -> Dict[str, Dict]:
+    if cache_path is None or not cache_path.exists():
+        return {}
+    try:
+        import json
+        with open(cache_path, "r") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _index_cache_save(cache_path: Optional[Path], cache: Dict[str, Dict]) -> None:
+    if cache_path is None:
+        return
+    try:
+        import json
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        with open(tmp, "w") as fh:
+            json.dump(cache, fh)
+        tmp.replace(cache_path)
+    except OSError:
+        pass  # cache write is best-effort
+
+
 def load_audio_files(
     root: Path,
     *,
@@ -306,8 +340,18 @@ def load_audio_files(
     audio_ext: str = ".wav",
     annotation_ext: str = ".csv",
     show_progress: bool = True,
+    max_workers: int = 16,
+    index_cache_path: Optional[Path] = None,
 ) -> List[AudioFile]:
-    """Discover and index all audio files plus their annotations under ``root``."""
+    """Discover and index all audio files plus their annotations under ``root``.
+
+    Audio headers are read in parallel (``max_workers`` threads) and cached
+    on disk at ``index_cache_path`` (default ``<root>/.whalevad_audio_index.json``)
+    keyed by file mtime.  Subsequent runs skip headers that haven't changed.
+    Pass ``index_cache_path=Path("/dev/null")`` to disable the cache.
+    """
+    import concurrent.futures as _cf
+
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {root}")
@@ -318,19 +362,61 @@ def load_audio_files(
     if not pairs:
         raise RuntimeError(f"No audio files found under {root}")
 
+    if index_cache_path is None:
+        index_cache_path = root / ".whalevad_audio_index.json"
+    elif str(index_cache_path) in {"/dev/null", "none", "NONE"}:
+        index_cache_path = None
+
+    cache = _index_cache_load(index_cache_path)
+
+    # Split pairs into cached-fresh and need-to-read.
+    info_by_path: Dict[str, Tuple[int, int]] = {}
+    to_read: List[Tuple[Path, float]] = []
+    for audio_path, _csv in pairs:
+        key = str(audio_path)
+        mtime = _safe_mtime(audio_path)
+        entry = cache.get(key)
+        if isinstance(entry, dict) and entry.get("mtime") == mtime:
+            info_by_path[key] = (int(entry["sample_rate"]), int(entry["num_frames"]))
+        else:
+            to_read.append((audio_path, mtime))
+
+    # Parallel-read the fresh ones.
+    if to_read:
+        def _read(item: Tuple[Path, float]) -> Tuple[str, Dict[str, float]]:
+            ap, mt = item
+            sr, nf = _audio_info(ap)
+            return str(ap), {"sample_rate": sr, "num_frames": nf, "mtime": mt}
+
+        workers = max(1, min(max_workers, len(to_read)))
+        with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            results = ex.map(_read, to_read)
+            results = progress(
+                results,
+                desc=f"Indexing {root.name}",
+                total=len(to_read),
+                disable=not show_progress,
+                unit="file",
+            )
+            for key, entry in results:
+                info_by_path[key] = (entry["sample_rate"], entry["num_frames"])
+                cache[key] = entry
+        _index_cache_save(index_cache_path, cache)
+
     audio_files: List[AudioFile] = []
     # Cache per-site CSV rows so we only parse each file once.
     site_csv_cache: Dict[Path, List[Dict[str, str]]] = {}
 
     iterator = progress(
         pairs,
-        desc=f"Indexing {root.name}",
+        desc=f"Pairing {root.name} annotations",
         total=len(pairs),
         disable=not show_progress,
         unit="file",
+        leave=False,
     )
     for audio_path, csv_path in iterator:
-        sample_rate, num_frames = _audio_info(audio_path)
+        sample_rate, num_frames = info_by_path[str(audio_path)]
         duration_s = num_frames / float(sample_rate)
 
         anns: List[Annotation] = []
@@ -712,13 +798,23 @@ class ATBFLDataset(Dataset):
 # ------------------------------------------------------------- audio loading
 
 
-def _have_soundfile() -> bool:
-    try:
-        import soundfile  # noqa: F401
+# Cached soundfile module reference so we only pay the import cost once.
+_SOUNDFILE_MODULE = None  # type: ignore[var-annotated]
 
-        return True
-    except Exception:
+
+def _have_soundfile() -> bool:
+    global _SOUNDFILE_MODULE
+    if _SOUNDFILE_MODULE is False:
         return False
+    if _SOUNDFILE_MODULE is None:
+        try:
+            import soundfile as _sf  # type: ignore
+
+            _SOUNDFILE_MODULE = _sf
+        except Exception:
+            _SOUNDFILE_MODULE = False
+            return False
+    return True
 
 
 def _audio_info(path: Path) -> Tuple[int, int]:
@@ -730,9 +826,7 @@ def _audio_info(path: Path) -> Tuple[int, int]:
     """
     p = str(path)
     if _have_soundfile():
-        import soundfile as sf
-
-        info = sf.info(p)
+        info = _SOUNDFILE_MODULE.info(p)  # type: ignore[union-attr]
         return int(info.samplerate), int(info.frames)
     # stdlib wave (PCM WAV only)
     if path.suffix.lower() == ".wav":

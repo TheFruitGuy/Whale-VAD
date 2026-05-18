@@ -15,7 +15,7 @@ import random
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import Tensor
@@ -98,6 +98,8 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # -------------------- data
+        train_cache = self._resolve_index_cache_path(cfg.train_root)
+        val_cache = self._resolve_index_cache_path(cfg.val_root)
         log.info("Indexing training set: %s", cfg.train_root)
         self.train_audio = load_audio_files(
             Path(cfg.train_root),
@@ -105,6 +107,8 @@ class Trainer:
             annotation_subdir=cfg.annotation_subdir,
             audio_ext=cfg.audio_ext,
             annotation_ext=cfg.annotation_ext,
+            max_workers=cfg.audio_index_workers,
+            index_cache_path=train_cache,
         )
         log.info("Indexing validation set: %s", cfg.val_root)
         self.val_audio = load_audio_files(
@@ -113,6 +117,8 @@ class Trainer:
             annotation_subdir=cfg.annotation_subdir,
             audio_ext=cfg.audio_ext,
             annotation_ext=cfg.annotation_ext,
+            max_workers=cfg.audio_index_workers,
+            index_cache_path=val_cache,
         )
 
         self._rng = random.Random(cfg.seed)
@@ -229,6 +235,23 @@ class Trainer:
         self.history: List[Dict[str, Any]] = []
 
     # ----------------------------------------------------------- setup
+
+    def _resolve_index_cache_path(self, dataset_root: str) -> Optional[Path]:
+        """Pick the on-disk audio-index cache location for ``dataset_root``.
+
+        Empty string -> use the dataset's own ``.whalevad_audio_index.json``;
+        ``"none"`` -> disable caching; otherwise resolve as a path.  When the
+        config supplies a single path for two splits we suffix it with the
+        split name to keep them separate.
+        """
+        raw = (self.cfg.audio_index_cache_path or "").strip()
+        if not raw:
+            return None  # let load_audio_files default to <root>/.whalevad_audio_index.json
+        if raw.lower() in {"none", "/dev/null"}:
+            return Path("/dev/null")
+        p = Path(raw)
+        # If the same path is configured for both splits, namespace it.
+        return p / f"{Path(dataset_root).name}.json" if p.is_dir() else p
 
     def _setup_seed(self, seed: int) -> None:
         random.seed(seed)
