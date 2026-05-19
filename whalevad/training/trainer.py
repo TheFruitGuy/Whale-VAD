@@ -92,6 +92,16 @@ class Trainer:
 
     def __init__(self, cfg: TrainingConfig) -> None:
         self.cfg = cfg
+        # File-descriptor based tensor sharing across DataLoader workers
+        # blows past the default ``ulimit -n`` when ``num_workers`` is
+        # large; ``file_system`` sharing uses temp files instead and has
+        # no such limit.  Safe to call repeatedly.
+        try:
+            import torch.multiprocessing as _tmp
+
+            _tmp.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass  # already set or unsupported on this platform
         self._setup_seed(cfg.seed)
         self.device = torch.device(cfg.device)
         self.output_dir = Path(cfg.output_dir)
@@ -356,7 +366,12 @@ class Trainer:
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory and torch.cuda.is_available(),
             collate_fn=collate_segments,
-            persistent_workers=cfg.num_workers > 0,
+            # ``persistent_workers`` is intentionally off: we build a new
+            # DataLoader per epoch (negatives are re-sampled), so reusing
+            # workers across iterations of the *same* loader buys us
+            # nothing and keeps old workers alive long enough to exhaust
+            # the FD limit when the next loader starts.
+            persistent_workers=False,
             drop_last=shuffle,
             worker_init_fn=self._seed_worker,
             generator=generator,
@@ -371,8 +386,13 @@ class Trainer:
             self._resample_negatives()
             train_loader = self._make_dataloader(self.train_dataset, shuffle=True)
             train_metrics = self._train_one_epoch(train_loader)
+            # Explicitly tear down train workers before the val loader
+            # spawns its own; together with persistent_workers=False this
+            # halves peak FD usage during the train->val handover.
+            del train_loader
             val_loader = self._make_dataloader(self.val_dataset, shuffle=False)
             val_metrics = self.validate(val_loader)
+            del val_loader
             elapsed = time.time() - t0
             entry = {
                 "epoch": epoch,
