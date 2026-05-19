@@ -238,6 +238,12 @@ class Trainer:
             weight_decay=cfg.weight_decay,
         )
 
+        # -------------------- LR scheduler (not in the paper but
+        # empirically necessary; cf. the user's previous baseline at
+        # lr=5e-5 with ReduceLROnPlateau(patience=8, factor=0.5) which
+        # outperformed the paper-faithful constant-LR setup).
+        self.lr_scheduler = self._build_lr_scheduler()
+
         # -------------------- state
         self.epoch = 0
         self.global_step = 0
@@ -262,6 +268,54 @@ class Trainer:
         p = Path(raw)
         # If the same path is configured for both splits, namespace it.
         return p / f"{Path(dataset_root).name}.json" if p.is_dir() else p
+
+    def _build_lr_scheduler(self):
+        """Build the optional learning-rate scheduler.
+
+        Modes (set via ``cfg.lr_scheduler``):
+
+        * ``"none"`` — keep ``lr`` constant (paper default).
+        * ``"reduce_on_plateau"`` — ``ReduceLROnPlateau`` driven by the
+          validation BCE loss (``cfg.lr_patience``, ``cfg.lr_factor``,
+          ``cfg.lr_min``).  Empirically necessary on the 2026 ATBFL set;
+          matches the user's previous baseline.
+        * ``"cosine"`` — cosine annealing over ``cfg.epochs``.
+        """
+        mode = getattr(self.cfg, "lr_scheduler", "none") or "none"
+        mode = mode.lower()
+        if mode in {"none", ""}:
+            return None
+        if mode == "reduce_on_plateau":
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+            return ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=getattr(self.cfg, "lr_factor", 0.5),
+                patience=getattr(self.cfg, "lr_patience", 8),
+                min_lr=getattr(self.cfg, "lr_min", 1e-7),
+            )
+        if mode == "cosine":
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+
+            return CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, self.cfg.epochs),
+                eta_min=getattr(self.cfg, "lr_min", 1e-7),
+            )
+        raise ValueError(f"Unknown lr_scheduler={mode!r}")
+
+    def _step_lr_scheduler(self, val_metrics: Dict[str, float]) -> None:
+        if self.lr_scheduler is None:
+            return
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+        if isinstance(self.lr_scheduler, ReduceLROnPlateau):
+            self.lr_scheduler.step(val_metrics.get("bce_loss", math.inf))
+        else:
+            self.lr_scheduler.step()
+        new_lr = self.optimizer.param_groups[0]["lr"]
+        log.info("  current LR=%.2e", new_lr)
 
     def _setup_seed(self, seed: int) -> None:
         """Seed every randomness source we know about for reproducibility.
@@ -335,18 +389,28 @@ class Trainer:
 
     def _resample_negatives(self) -> None:
         cfg = self.cfg
-        num_neg = int(round(cfg.pos_to_neg_ratio * len(self.positive_segments)))
-        negatives = (
-            self.neg_sampler.sample(num_neg)
-            if self.neg_sampler.has_negatives
-            else []
-        )
+        every = max(1, int(getattr(cfg, "neg_resample_every_epochs", 1)))
+        # Always sample on the first epoch; afterwards only every ``every``
+        # epochs.  Between resamples we keep re-shuffling the same pool.
+        if self.epoch == 1 or (self.epoch - 1) % every == 0:
+            num_neg = int(round(cfg.pos_to_neg_ratio * len(self.positive_segments)))
+            negatives = (
+                self.neg_sampler.sample(num_neg)
+                if self.neg_sampler.has_negatives
+                else []
+            )
+            self._cached_negatives = list(negatives)
+            action = "resampled"
+        else:
+            negatives = getattr(self, "_cached_negatives", [])
+            action = "reused"
         merged = list(self.positive_segments) + list(negatives)
         self._rng.shuffle(merged)
         self.train_dataset.set_segments(merged)
         log.info(
-            "Epoch %d: %d positives + %d negatives = %d segments",
+            "Epoch %d (%s): %d positives + %d negatives = %d segments",
             self.epoch,
+            action,
             len(self.positive_segments),
             len(negatives),
             len(merged),
@@ -404,6 +468,7 @@ class Trainer:
             self._save_history()
             self._save_checkpoint(val_metrics, latest=True)
             self._maybe_save_best(val_metrics)
+            self._step_lr_scheduler(val_metrics)
             log.info(
                 "[epoch %d] train_loss=%.4f val_bce=%.4f val_f1=%.4f (%.1fs)",
                 epoch,

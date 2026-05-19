@@ -80,6 +80,18 @@ class TrainingConfig:
     grad_clip: Optional[float] = 1.0
     # Approximate positive:negative balance per epoch (Section 5.5).
     pos_to_neg_ratio: float = 1.0
+    # How often to resample the negative segment pool.  The paper says
+    # every epoch; empirically once every few epochs gives a more stable
+    # signal and lets the model lock in features between resamples.
+    neg_resample_every_epochs: int = 1
+
+    # ------------------------------------------------------ LR scheduler
+    # Paper trains at a constant ``learning_rate``; in practice
+    # ``reduce_on_plateau`` matches the strongest known baseline.
+    lr_scheduler: Literal["none", "reduce_on_plateau", "cosine"] = "none"
+    lr_patience: int = 8       # ReduceLROnPlateau patience
+    lr_factor: float = 0.5     # ReduceLROnPlateau decay factor
+    lr_min: float = 1e-7       # floor for both schedulers
 
     # ----------------------------------------------------- Augmentation
     # The paper finds these to be counterproductive; disabled by default.
