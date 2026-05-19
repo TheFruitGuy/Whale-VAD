@@ -483,3 +483,60 @@ def test_trainer_with_bounding_boxes(tiny_dataset: Tuple[Path, Path]) -> None:
     trainer = Trainer(cfg)
     result = trainer.fit()
     assert len(result["history"]) == 1
+
+
+def test_evaluator_loads_checkpoint_and_scans_segments(
+    tiny_dataset: Tuple[Path, Path],
+) -> None:
+    """End-to-end: train a tiny model, then run the Evaluator on best.pt
+    across a couple of segment lengths."""
+    from whalevad.training import EvalConfig, Evaluator
+
+    train, val = tiny_dataset
+    out = train.parent / "runs_for_eval"
+    cfg = TrainingConfig(
+        train_root=str(train),
+        val_root=str(val),
+        num_classes=3,
+        loss_type="focal",
+        epochs=1,
+        batch_size=2,
+        num_workers=0,
+        collar_min_s=0.5,
+        collar_max_s=1.0,
+        neg_min_dur_s=1.0,
+        neg_max_dur_s=3.0,
+        eval_segment_s=10.0,
+        eval_overlap_s=2.0,
+        pos_to_neg_ratio=1.0,
+        device="cpu",
+        output_dir=str(out),
+        log_interval=1,
+        pin_memory=False,
+        threshold_search_grid=11,
+    )
+    Trainer(cfg).fit()
+    assert (out / "best.pt").exists()
+
+    eval_cfg = EvalConfig(
+        checkpoint=str(out / "best.pt"),
+        val_root=str(val),
+        output_dir=str(out / "eval"),
+        segment_lengths_s=(10.0, 15.0),
+        overlap_s=2.0,
+        batch_size=2,
+        num_workers=0,
+        device="cpu",
+        threshold_search_grid=11,
+    )
+    results = Evaluator(eval_cfg).run()
+    assert set(results.keys()) == {10.0, 15.0}
+    for seg, r in results.items():
+        assert r.segment_s == seg
+        # Three classes (bmabz, d, bp) regardless of training num_classes.
+        assert len(r.per_class) == 3
+        for c in r.per_class:
+            assert 0.0 <= c.frame_f1 <= 1.0
+            assert 0.0 <= c.event_f1 <= 1.0
+    assert (Path(eval_cfg.output_dir) / "eval_results.json").exists()
+

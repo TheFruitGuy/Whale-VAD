@@ -25,6 +25,7 @@ from .dataset import (
     CLASS_MAP_3,
     SEVEN_TO_THREE,
 )
+from .evaluator import EvalConfig, Evaluator, PerClassResult, SegmentLengthResult
 from .sampling import StochasticNegativeSampler
 from .losses import (
     WeightedBCELoss,
@@ -65,4 +66,8 @@ __all__ = [
     "probabilities_to_calls",
     "collapse_seven_to_three",
     "Trainer",
+    "EvalConfig",
+    "Evaluator",
+    "PerClassResult",
+    "SegmentLengthResult",
 ]
