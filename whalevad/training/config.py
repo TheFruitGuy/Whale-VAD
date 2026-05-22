@@ -60,7 +60,11 @@ class TrainingConfig:
     feat_channels: int = 3  # trig representation has 3 channels
 
     # ----------------------------------------------------------- Loss
-    loss_type: Literal["bce", "focal"] = "focal"
+    # Loss: the released 0.440 model uses *weighted BCE* (confirmed by
+    # the authors directly — the DCASE paper's "+ Focal loss" row means
+    # focal *replacing* weighted BCE, and it was found to train slower
+    # with smaller gradients, so the final model used weighted BCE).
+    loss_type: Literal["bce", "focal"] = "bce"
     # Focal loss hyper-parameters from the original paper (Section 5.6).
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
@@ -68,6 +72,10 @@ class TrainingConfig:
     regression_loss_weight: float = 1.0
 
     # ----------------------------------------------------------- Optimiser
+    # The DCASE paper reports 1e-5, which the authors used with a very
+    # large batch size and long segments on L40 GPUs.  For desktop-class
+    # training the authors recommend ~1e-3 (100x) with ~15 epochs; pass
+    # ``--learning-rate 1e-3 --epochs 15`` in that setting.
     learning_rate: float = 1e-5
     weight_decay: float = 1e-3
     beta1: float = 0.9

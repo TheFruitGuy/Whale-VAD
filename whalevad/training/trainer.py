@@ -367,20 +367,24 @@ class Trainer:
     def _compute_pos_weight(self) -> Tensor:
         """Per-class :math:`w_c = N / P_c` weighting (Section 5.6).
 
-        ``N`` is the total number of *negative* segments visible to the
-        model in one epoch — i.e. the resampled negatives.  In the
-        absence of a known per-epoch negative count we use the
-        positive segment count as a rough proxy (the paper balances
-        these per mini-batch).
+        ``P_c`` is the number of positive *segments* containing class
+        ``c`` (a segment is counted once per class it contains, not once
+        per annotation — counting annotations over-weights segments with
+        repeated calls of the same type).  ``N`` is the number of
+        negative (no-call) segments per epoch, approximated by the
+        positive-segment count scaled by ``pos_to_neg_ratio`` since the
+        sampler balances roughly 1:1.
         """
         cfg = self.cfg
         class_to_idx = {n: i for i, n in enumerate(self.class_names)}
         pos_counts = torch.zeros((cfg.num_classes,), dtype=torch.float32)
         for seg in self.positive_segments:
+            classes_in_seg = set()
             for ann in seg.annotations:
                 cls = map_label_to_class(ann.label, cfg.num_classes)
-                if cls is None:
-                    continue
+                if cls is not None:
+                    classes_in_seg.add(cls)
+            for cls in classes_in_seg:
                 pos_counts[class_to_idx[cls]] += 1.0
         n_neg = max(1, int(len(self.positive_segments) * cfg.pos_to_neg_ratio))
         return compute_bce_pos_weight(pos_counts, n_neg)

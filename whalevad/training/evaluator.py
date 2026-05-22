@@ -25,7 +25,7 @@ import logging
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -38,16 +38,13 @@ from .dataset import (
     ATBFLDataset,
     AudioFile,
     CLASS_MAP_3,
-    CLASS_MAP_7,
-    Segment,
     build_eval_segments,
     collate_segments,
     load_audio_files,
     map_label_to_class,
-    num_spec_frames,
     resolve_class_names,
 )
-from .metrics import find_optimal_thresholds, macro_f1
+from .metrics import find_optimal_thresholds
 from .postprocessing import (
     CallEvent,
     collapse_seven_to_three,
@@ -407,10 +404,11 @@ class Evaluator:
                 if cls is None or cls not in self.eval_class_names:
                     continue
                 c = self.eval_class_names.index(cls)
-                start_frame = max(0, int(math.ceil(ann.onset_s / self.hop_s)))
-                end_frame = min(num_frames - 1, int(math.floor(ann.offset_s / self.hop_s)) - 1)
-                if end_frame >= start_frame:
-                    tgt[start_frame : end_frame + 1, c] = 1.0
+                # Floor-based assignment, consistent with build_frame_labels.
+                start_frame = max(0, int(math.floor(ann.onset_s / self.hop_s)))
+                end_frame = min(num_frames, int(math.floor(ann.offset_s / self.hop_s)))
+                if end_frame > start_frame:
+                    tgt[start_frame:end_frame, c] = 1.0
             per_file_targets[af.path] = tgt
 
         # 6. Concatenate across recordings and find optimal thresholds.

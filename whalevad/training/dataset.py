@@ -684,11 +684,13 @@ def build_frame_labels(
 ) -> Tensor:
     """Construct the binary frame-level target vector for one segment.
 
-    A frame ``n`` is labelled positive for class ``c`` when there exists
-    a same-class annotation that *fully* covers the frame interval
-    ``[n*hop, (n+1)*hop)`` (Section 5.1: "When a human annotation
-    boundary intersects completely with the classification target
-    vector at a time instant, the label is true").
+    Frame ``n`` (covering ``[n*hop, (n+1)*hop)``) is labelled positive
+    for class ``c`` when a same-class annotation overlaps it.  We use
+    the standard floor-based assignment — frames ``floor(onset/hop)``
+    through ``floor(offset/hop)`` (exclusive) — matching the authors'
+    reference implementation.  This is slightly more lenient at the
+    boundary than a strict "fully contained" rule and gives short calls
+    (d, bp average ~1.4 s) a couple of extra positive frames.
     """
     labels = torch.zeros((num_frames, num_classes), dtype=torch.float32)
     if num_frames == 0:
@@ -698,17 +700,13 @@ def build_frame_labels(
         if target_label is None:
             continue
         cls_idx = class_to_idx[target_label]
-        # Frame n covers [t0, t1) inside the segment.
-        # Annotation interval relative to segment start:
-        a0 = ann.onset_s - segment.start_s
-        a1 = ann.offset_s - segment.start_s
-        # First frame whose start is >= a0:
-        start_frame = max(0, int(math.ceil((a0 - frame_offset_s) / hop_s)))
-        # Last frame whose end (n+1)*hop is <= a1:
-        end_frame = int(math.floor((a1 - frame_offset_s) / hop_s)) - 1
-        end_frame = min(num_frames - 1, end_frame)
-        if end_frame >= start_frame:
-            labels[start_frame : end_frame + 1, cls_idx] = 1.0
+        # Annotation interval relative to segment start.
+        a0 = ann.onset_s - segment.start_s - frame_offset_s
+        a1 = ann.offset_s - segment.start_s - frame_offset_s
+        start_frame = max(0, int(math.floor(a0 / hop_s)))
+        end_frame = min(num_frames, int(math.floor(a1 / hop_s)))  # exclusive
+        if end_frame > start_frame:
+            labels[start_frame:end_frame, cls_idx] = 1.0
     return labels
 
 
